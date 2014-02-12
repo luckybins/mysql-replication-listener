@@ -34,6 +34,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <boost/lexical_cast.hpp>
+#include <boost/algorithm/string.hpp>
 
 #include "protocol.h"
 #include "binlog_event.h"
@@ -52,6 +53,7 @@ static int encrypt_password(boost::uint8_t *reply,   /* buffer at least EVP_MAX_
                             const boost::uint8_t *scramble_buff,
                             const char *pass);
 static int hash_sha1(boost::uint8_t *output, ...);
+static void store_handshake_package(st_handshake_package* dest, const st_handshake_package& src);
 
     int Binlog_tcp_driver::connect(const std::string& user, const std::string& passwd,
                                    const std::string& host, long port,
@@ -64,7 +66,7 @@ static int hash_sha1(boost::uint8_t *output, ...);
 
   if (!m_socket)
   {
-    if ((m_socket=sync_connect_and_authenticate(m_io_service, user, passwd, host, port)) == 0)
+    if ((m_socket=sync_connect_and_authenticate(m_io_service, user, passwd, host, port, &m_handshake_package)) == 0)
       return 1;
   }
 
@@ -73,7 +75,7 @@ static int hash_sha1(boost::uint8_t *output, ...);
    */
   if (binlog_filename == "")
   {
-    if (fetch_master_status(m_socket, &m_binlog_file_name, &m_binlog_offset))
+    if (fetch_master_status(m_socket, &m_binlog_file_name, &m_binlog_offset, m_handshake_package.server_capabilities))
       return 1;
   } else
   {
@@ -81,6 +83,9 @@ static int hash_sha1(boost::uint8_t *output, ...);
     m_binlog_offset=offset;
   }
 
+  if (notify_and_check_server_checksum(m_socket, m_handshake_package.server_capabilities)) {
+    return 2;
+  }
 
   /* We're ready to start the io service and request the binlog dump. */
   start_binlog_dump(m_binlog_file_name, m_binlog_offset);
@@ -88,7 +93,9 @@ static int hash_sha1(boost::uint8_t *output, ...);
   return 0;
 }
 
-tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service, const std::string &user, const std::string &passwd, const std::string &host, long port)
+tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service,
+    const std::string &user, const std::string &passwd,
+    const std::string &host, long port, st_handshake_package* p_handshake_package)
 {
 
   tcp::resolver resolver(io_service);
@@ -163,7 +170,8 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service, 
   struct st_handshake_package handshake_package;
 
   proto_get_handshake_package(server_stream, handshake_package, packet_length);
-
+  store_handshake_package(p_handshake_package, handshake_package);
+  const boost::uint32_t capabilities = handshake_package.server_capabilities;
   if (authenticate(socket, user, passwd, handshake_package))
     return 0;
 
@@ -194,7 +202,7 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service, 
     }
   }
 
-  boost::uint32_t master_server_id = 0;
+  boost::uint32_t master_server_id = 123; // Should be args to get.
   boost::uint8_t host_size = host.size();
   boost::uint8_t user_size = user.size();
   boost::uint8_t passwd_size = passwd.size();
@@ -242,15 +250,18 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service, 
 
   cmd_response_stream >> prot_result_type;
 
-  if (result_type == 0)
+  if (result_type ==  TYPE_OK_PACKET)
   {
     struct st_ok_package ok_package;
-    prot_parse_ok_message(cmd_response_stream, ok_package, packet_length);
-  } else
-  {
+    prot_parse_ok_message(cmd_response_stream, ok_package, packet_length, capabilities);
+  } else if (result_type == TYPE_ERR_PACKET) {
     struct st_error_package error_package;
-    prot_parse_error_message(cmd_response_stream, error_package, packet_length);
+    prot_parse_error_message(cmd_response_stream, error_package, packet_length, capabilities);
+    std::cout << error_package.message << std::endl;
     return 0;
+  } else if (result_type == TYPE_EOF_PACKET) {
+    struct st_eof_package eof_package;
+    prot_parse_eof_message(cmd_response_stream, eof_package, capabilities);
   }
 
   return socket;
@@ -305,7 +316,8 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service, 
 /**
  Helper function used to extract the event header from a memory block
  */
-static void proto_event_packet_header(boost::asio::streambuf &event_src, Log_event_header *h)
+static bool proto_event_packet_header(boost::asio::streambuf &event_src, Log_event_header *h, 
+    const int packet_length, const boost::uint32_t capabilities)
 {
   std::istream is(&event_src);
 
@@ -317,16 +329,24 @@ static void proto_event_packet_header(boost::asio::streambuf &event_src, Log_eve
   Protocol_chunk<boost::uint32_t> prot_next_position(h->next_position);
   Protocol_chunk<boost::uint16_t> prot_flags(h->flags);
 
-  is >> prot_marker
-          >> prot_timestamp
+  is  >> prot_marker;
+  if (h->marker == 0xff) {
+    st_error_package err;
+    prot_parse_error_message(is, err, packet_length, capabilities);
+    std::cerr << err.message << std::endl;
+    return false;
+  } else {
+    is    >> prot_timestamp
           >> prot_type_code
           >> prot_server_id
           >> prot_event_length
           >> prot_next_position
           >> prot_flags;
+    return true;
+  }
 }
 
-void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, std::size_t bytes_transferred)
+void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, std::size_t bytes_transferred, int packet_length)
 {
   if (err)
   {
@@ -364,7 +384,9 @@ void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, 
       dynamic payload.
      */
     //std::cerr << "Consuming event stream for header. Size before: " << m_event_stream_buffer.size() << std::endl;
-    proto_event_packet_header(m_event_stream_buffer, m_waiting_event);
+    if (!proto_event_packet_header(m_event_stream_buffer, m_waiting_event, packet_length, m_handshake_package.server_capabilities)) {
+      m_shutdown = true;
+    }
     //std::cerr << " Size after: " << m_event_stream_buffer.size() << std::endl;
   }
 
@@ -376,13 +398,36 @@ void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, 
      size of the header, the event object is complete.
      Next we need to parse the payload buffer
      */
+    m_waiting_event->event_length -= 4; /// ignore checksum
     std::istream is(&m_event_stream_buffer);
     Binary_log_event * event= parse_event(is, m_waiting_event);
-
+    if (m_waiting_event->type_code == FORMAT_DESCRIPTION_EVENT) {
+      m_format_desc_event = dynamic_cast<Format_event&>(*event);
+    }
     m_event_stream_buffer.consume(m_event_stream_buffer.size());
-
     m_event_queue->push_front(event);
 
+    //////////////////////////
+    /*{
+      boost::uint8_t pack = 0;
+      boost::asio::streambuf resp;
+      int length = proto_get_one_package(m_socket, resp, &pack);
+      std::istream response_stream(&resp);
+
+      boost::uint8_t result_type;
+      Protocol_chunk<boost::uint8_t> prot_result_type(result_type);
+
+
+      response_stream >> prot_result_type;
+      if (result_type == TYPE_ERR_PACKET)
+      {
+        struct st_error_package error_package;
+        prot_parse_error_message(response_stream, error_package, length, m_handshake_package.server_capabilities);
+        std::cout << error_package.message << std::endl;
+        return;
+      }
+    }*/
+    ///////////////////////
     /*
       Note on memory management: The pushed Binary_log_event will be
       deleted in user land.
@@ -396,7 +441,8 @@ void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, 
 
 }
 
-void Binlog_tcp_driver::handle_net_packet_header(const boost::system::error_code& err, std::size_t bytes_transferred)
+void Binlog_tcp_driver::handle_net_packet_header(
+    const boost::system::error_code& err, std::size_t bytes_transferred)
 {
   if (err)
   {
@@ -422,6 +468,7 @@ void Binlog_tcp_driver::handle_net_packet_header(const boost::system::error_code
   packet_length+=(unsigned long) ((m_net_header[1] &0xFF) << 8);
   packet_length+=(unsigned long) ((m_net_header[2] &0xFF) << 16);
 
+
   // TODO validate packet sequence numbers
   //int packet_no=(unsigned char) m_net_header[3];
 
@@ -439,7 +486,8 @@ void Binlog_tcp_driver::handle_net_packet_header(const boost::system::error_code
                           boost::bind(&Binlog_tcp_driver::handle_net_packet,
                                       this,
                                       boost::asio::placeholders::error,
-                                      boost::asio::placeholders::bytes_transferred));
+                                      boost::asio::placeholders::bytes_transferred,
+                                      packet_length));
 
 }
 
@@ -451,6 +499,7 @@ void Binlog_tcp_driver::handle_net_packet_header(const boost::system::error_code
     /*
      * Send authentication package
      */
+    const boost::uint32_t capabilities = handshake_package.server_capabilities;
     boost::asio::streambuf auth_request_header;
     boost::asio::streambuf auth_request;
     std::string database("mysql"); // 0 terminated
@@ -463,12 +512,15 @@ void Binlog_tcp_driver::handle_net_packet_header(const boost::system::error_code
 
     boost::uint8_t reply[EVP_MAX_MD_SIZE];
     memset(reply, '\0', EVP_MAX_MD_SIZE);
-    boost::uint8_t scramble_buff[21];
+    //boost::uint8_t scramble_buff[21];
+    boost::uint8_t* scramble_buff = new boost::uint8_t[handshake_package.scramble_buff2.length() + 8];
     memcpy(scramble_buff, handshake_package.scramble_buff, 8);
-    memcpy(scramble_buff+8, handshake_package.scramble_buff2, 13);
+    memcpy(scramble_buff+8, handshake_package.scramble_buff2.c_str(), handshake_package.scramble_buff2.length());
+    
     int passwd_length= 0;
     if (passwd.size() > 0)
       passwd_length= encrypt_password(reply, scramble_buff, passwd.c_str());
+    delete scramble_buff;
 
     static boost::uint32_t client_basic_flags = CLIENT_BASIC_FLAGS;
     static boost::uint32_t max_packet_size = MAX_PACKAGE_SIZE;
@@ -518,16 +570,19 @@ void Binlog_tcp_driver::handle_net_packet_header(const boost::system::error_code
 
     auth_response_stream >> prot_result_type;
 
-    if (result_type == 0)
+    if (result_type == TYPE_OK_PACKET)
     {
       struct st_ok_package ok_package;
-      prot_parse_ok_message(auth_response_stream, ok_package, packet_length);
-    } else
+      prot_parse_ok_message(auth_response_stream, ok_package, packet_length, capabilities);
+    } else if (result_type == TYPE_ERR_PACKET)
     {
       struct st_error_package error_package;
-      prot_parse_error_message(auth_response_stream, error_package, packet_length);
+      prot_parse_error_message(auth_response_stream, error_package, packet_length, capabilities);
       std::cout << error_package.message << std::endl;
       return 1;
+    } else if (result_type == TYPE_EOF_PACKET) {
+      struct st_eof_package eof_package;
+      prot_parse_eof_message(auth_response_stream, eof_package, capabilities);
     }
 
     return 0;
@@ -557,6 +612,7 @@ void Binlog_tcp_driver::start_event_loop()
     if (err)
     {
       // TODO what error appear here?
+      std::cerr << "Got an error " << err << ", reconnect..." << std::endl;
     }
 
     /*
@@ -628,11 +684,12 @@ int Binlog_tcp_driver::set_position(const std::string &str, unsigned long positi
   boost::asio::io_service io_service;
   tcp::socket *socket;
 
-  if ((socket= sync_connect_and_authenticate(io_service, m_user, m_passwd, m_host, m_port)) == 0)
+  if ((socket= sync_connect_and_authenticate(
+      io_service, m_user, m_passwd, m_host, m_port, &m_handshake_package)) == 0)
     return ERR_FAIL;
 
   std::map<std::string, unsigned long > binlog_map;
-  fetch_binlogs_name_and_size(socket, binlog_map);
+  fetch_binlogs_name_and_size(socket, binlog_map, m_handshake_package.server_capabilities);
   socket->close();
   delete socket;
 
@@ -681,10 +738,11 @@ int Binlog_tcp_driver::get_position(std::string *filename_ptr, unsigned long *po
 
   tcp::socket *socket;
 
-  if ((socket=sync_connect_and_authenticate(io_service, m_user, m_passwd, m_host, m_port)) == 0)
+  if ((socket=sync_connect_and_authenticate(
+      io_service, m_user, m_passwd, m_host, m_port, &m_handshake_package)) == 0)
     return ERR_FAIL;
 
-  if (fetch_master_status(socket, &m_binlog_file_name, &m_binlog_offset))
+  if (fetch_master_status(socket, &m_binlog_file_name, &m_binlog_offset, m_handshake_package.server_capabilities))
     return ERR_FAIL;
 
   socket->close();
@@ -696,7 +754,7 @@ int Binlog_tcp_driver::get_position(std::string *filename_ptr, unsigned long *po
   return ERR_OK;
 }
 
-bool fetch_master_status(tcp::socket *socket, std::string *filename, unsigned long *position)
+bool fetch_master_status(tcp::socket *socket, std::string *filename, unsigned long *position, const boost::uint32_t capabilities)
 {
   boost::asio::streambuf server_messages;
 
@@ -716,7 +774,7 @@ bool fetch_master_status(tcp::socket *socket, std::string *filename, unsigned lo
   boost::asio::write(*socket, boost::asio::buffer(command_packet_header, 4), boost::asio::transfer_at_least(4));
   boost::asio::write(*socket, server_messages, boost::asio::transfer_at_least(size));
 
-  Result_set result_set(socket);
+  Result_set result_set(socket, capabilities);
 
   Converter conv;
   BOOST_FOREACH(Row_of_fields row, result_set)
@@ -730,7 +788,61 @@ bool fetch_master_status(tcp::socket *socket, std::string *filename, unsigned lo
   return false;
 }
 
-bool fetch_binlogs_name_and_size(tcp::socket *socket, std::map<std::string, unsigned long> &binlog_map)
+bool notify_and_check_server_checksum(tcp::socket *socket, const boost::uint32_t capabilities) {
+  boost::asio::streambuf server_messages;
+
+  std::ostream command_request_stream(&server_messages);
+
+  static boost::uint8_t com_query = COM_QUERY;
+  Protocol_chunk<boost::uint8_t> prot_command(com_query);
+
+  command_request_stream << prot_command
+          << "SET @master_binlog_checksum = @@global.binlog_checksum";
+
+  int size=server_messages.size();
+  char command_packet_header[4];
+  write_packet_header(command_packet_header, size, 0);
+
+  // Send the request.
+  boost::asio::write(*socket, boost::asio::buffer(command_packet_header, 4), boost::asio::transfer_at_least(4));
+  boost::asio::write(*socket, server_messages, boost::asio::transfer_at_least(size));
+
+  Result_set set_result_set(socket, capabilities);
+
+  Converter conv;
+  BOOST_FOREACH(Row_of_fields row, set_result_set)
+  {
+  }
+
+  server_messages.consume(server_messages.size());
+  command_request_stream << prot_command
+          << "SELECT @master_binlog_checksum";
+  size = server_messages.size();
+  write_packet_header(command_packet_header, size, 0);
+
+  boost::asio::write(*socket, boost::asio::buffer(command_packet_header, 4), boost::asio::transfer_at_least(4));
+  boost::asio::write(*socket, server_messages, boost::asio::transfer_at_least(size));
+
+  Result_set select_result_set(socket, capabilities);
+  
+  BOOST_FOREACH(Row_of_fields row, select_result_set)
+  {
+    std::string alg;
+    conv.to(alg, row[0]);
+    boost::to_lower(alg);
+    if (alg.compare("crc32") != 0) {
+      std::cerr << "unexpected cheksum algorithm" << std::endl;
+      if (alg.compare("(null)") == 0) {
+        std::cerr << "set checksum fail";
+        return true;
+      }
+    } 
+  }
+
+  return false;
+}
+
+bool fetch_binlogs_name_and_size(tcp::socket *socket, std::map<std::string, unsigned long> &binlog_map, const boost::uint32_t capabilities)
 {
   boost::asio::streambuf server_messages;
 
@@ -750,7 +862,7 @@ bool fetch_binlogs_name_and_size(tcp::socket *socket, std::map<std::string, unsi
   boost::asio::write(*socket, boost::asio::buffer(command_packet_header, 4), boost::asio::transfer_at_least(4));
   boost::asio::write(*socket, server_messages, boost::asio::transfer_at_least(size));
 
-  Result_set result_set(socket);
+  Result_set result_set(socket, capabilities);
 
   Converter conv;
   BOOST_FOREACH(Row_of_fields row, result_set)
@@ -819,6 +931,20 @@ int encrypt_password(boost::uint8_t *reply,   /* buffer at least EVP_MAX_MD_SIZE
   for ( i=0 ; i<length_reply ; ++i )
     reply[i] = hash_stage1[i] ^ reply[i];
   return length_reply;
+}
+static void store_handshake_package(st_handshake_package* dest, const st_handshake_package& src) {
+  dest->protocol_version = src.protocol_version;
+  dest->server_version_str = src.server_version_str;
+  dest->thread_id = src.thread_id;
+  int i;
+  for (i = 0; i < 8; i++) {
+    dest->scramble_buff[i] = src.scramble_buff[i];
+  }
+  dest->server_capabilities = src.server_capabilities;
+  dest->server_language = src.server_language;
+  dest->server_status = src.server_status;
+  dest->scramble_buff2 = src.scramble_buff2;
+  dest->auth_plugin_name = src.auth_plugin_name;
 }
 
 }} // end namespace mysql::system

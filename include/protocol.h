@@ -38,10 +38,12 @@ struct st_handshake_package
   std::string server_version_str;
   boost::uint32_t    thread_id;
   boost::uint8_t     scramble_buff[8];
-  boost::uint16_t    server_capabilities;
+  boost::uint32_t    server_capabilities;
   boost::uint8_t     server_language;
   boost::uint16_t    server_status;
-  boost::uint8_t     scramble_buff2[13];
+  //boost::uint8_t     scramble_buff2[13];
+  std::string scramble_buff2;
+  std::string auth_plugin_name;
 };
 
 /**
@@ -94,6 +96,11 @@ struct st_error_package
 #define CLIENT_MULTI_STATEMENTS (1UL << 16) /* Enable/disable multi-stmt support */
 #define CLIENT_MULTI_RESULTS    (1UL << 17) /* Enable/disable multi-results */
 
+#define CLIENT_PS_MULTI_RESULTS (1UL << 18)
+#define CLIENT_PLUGIN_AUTH      (1UL << 19)
+#define CLIENT_CONNECT_ATTRS    (1UL << 20)
+#define CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA (1UL << 21)
+
 #define CLIENT_SSL_VERIFY_SERVER_CERT (1UL << 30)
 #define CLIENT_REMEMBER_OPTIONS (1UL << 31)
 
@@ -116,6 +123,10 @@ struct st_error_package
                            CLIENT_SECURE_CONNECTION | \
                            CLIENT_MULTI_STATEMENTS | \
                            CLIENT_MULTI_RESULTS | \
+                           CLIENT_PS_MULTI_RESULTS | \
+                           CLIENT_PLUGIN_AUTH | \
+                           CLIENT_CONNECT_ATTRS | \
+                           CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | \
                            CLIENT_SSL_VERIFY_SERVER_CERT | \
                            CLIENT_REMEMBER_OPTIONS)
 
@@ -126,7 +137,11 @@ struct st_error_package
 */
 #define CLIENT_BASIC_FLAGS (((CLIENT_ALL_FLAGS & ~CLIENT_SSL) \
                                                & ~CLIENT_COMPRESS) \
-                                               & ~CLIENT_SSL_VERIFY_SERVER_CERT)
+                                               & ~CLIENT_SSL_VERIFY_SERVER_CERT \
+                                               & ~CLIENT_PS_MULTI_RESULTS \
+                                               & ~CLIENT_PLUGIN_AUTH \
+                                               & ~CLIENT_CONNECT_ATTRS \
+                                               & ~CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA)
 enum enum_server_command
 {
   COM_SLEEP, COM_QUIT, COM_INIT_DB, COM_QUERY, COM_FIELD_LIST,
@@ -378,11 +393,23 @@ public:
     Protocol_chunk_string_len(std::string &str)
     {
         m_storage= &str;
+        m_is_null = false;
     }
 
+    void set_null(bool is_null) { m_is_null = is_null; }
+    bool get_null() { return m_is_null; }
+protected:
+    std::string *m_storage;
 private:
     friend std::istream &operator>>(std::istream &is, Protocol_chunk_string_len &lenstr);
-    std::string *m_storage;
+    bool m_is_null;
+};
+
+class Protocol_chunk_string_encoded : public Protocol_chunk_string_len
+{
+public:
+  Protocol_chunk_string_encoded(std::string &str) : Protocol_chunk_string_len(str) {}
+  friend std::istream& operator >>(std::istream& is, Protocol_chunk_string_encoded& encstr);
 };
 
 buffer_source &operator>>(buffer_source &src, Protocol &chunk);
@@ -391,6 +418,7 @@ std::istream &operator>>(std::istream &is, Protocol &chunk);
 std::istream &operator>>(std::istream &is, std::string &str);
 std::istream &operator>>(std::istream &is, Protocol_chunk_string_len &lenstr);
 std::istream &operator>>(std::istream &is, Protocol_chunk_string &str);
+std::istream &operator >> (std::istream &is, Protocol_chunk_string_encoded& encstr);
 
 int proto_read_package_header(tcp::socket *socket, unsigned long *packet_length, unsigned char *packet_no);
 
@@ -412,10 +440,10 @@ int proto_read_package_header(tcp::socket *socket, boost::asio::streambuf &buff,
  * @return the size of the packet or 0 to indicate an error
  */
 int proto_get_one_package(tcp::socket *socket, boost::asio::streambuf &buff, boost::uint8_t *packet_no);
-void prot_parse_error_message(std::istream &is, struct st_error_package &err, int packet_length);
-void prot_parse_ok_message(std::istream &is, struct st_ok_package &ok, int packet_length);
-void prot_parse_eof_message(std::istream &is, struct st_eof_package &eof);
-void proto_get_handshake_package(std::istream &is, struct st_handshake_package &p, int packet_length);
+void prot_parse_error_message(std::istream &is, struct st_error_package &err, const int packet_length, const boost::uint32_t capabilities);
+void prot_parse_ok_message(std::istream &is, struct st_ok_package &ok, const int packet_length, const boost::uint32_t capabilities);
+void prot_parse_eof_message(std::istream &is, struct st_eof_package &eof, const boost::uint32_t capabilities);
+void proto_get_handshake_package(std::istream &is, struct st_handshake_package &p, const int packet_length);
 
 /**
   Allocates a new event and copy the header. The caller must be responsible for
@@ -424,11 +452,11 @@ void proto_get_handshake_package(std::istream &is, struct st_handshake_package &
 Query_event *proto_query_event(std::istream &is, Log_event_header *header);
 Rotate_event *proto_rotate_event(std::istream &is, Log_event_header *header);
 Incident_event *proto_incident_event(std::istream &is, Log_event_header *header);
-Row_event *proto_rows_event(std::istream &is, Log_event_header *header);
+Row_event *proto_rows_event(std::istream &is, Log_event_header *header, Format_event& format_desc_event);
 Table_map_event *proto_table_map_event(std::istream &is, Log_event_header *header);
 Int_var_event *proto_intvar_event(std::istream &is, Log_event_header *header);
 User_var_event *proto_uservar_event(std::istream &is, Log_event_header *header);
-
+Format_event* proto_desc_event(std::istream &is, Log_event_header *header);
 } // end namespace system
 } // end namespace mysql
 

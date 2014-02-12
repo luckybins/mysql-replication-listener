@@ -50,9 +50,12 @@ void Result_set::digest_row_set()
     switch(m_current_state)
     {
       case RESULT_HEADER:
-        system::digest_result_header(response_stream, m_field_count, m_extra);
+        system::digest_result_header(response_stream, m_field_count, m_extra, packet_length, m_capabilities);
         m_row_count= 0;
         m_current_state= FIELD_PACKETS;
+        if (m_field_count == 0) {
+          m_current_state = OK_PACKET;
+        }
         break;
       case FIELD_PACKETS:
       {
@@ -69,7 +72,7 @@ void Result_set::digest_row_set()
          char marker;
          response_stream >> marker;
          //assert(marker == 0xfe);
-         system::digest_marker(response_stream);
+         system::digest_marker(response_stream, m_capabilities);
          m_current_state= ROW_CONTENTS;
        }
        break;
@@ -77,7 +80,8 @@ void Result_set::digest_row_set()
        {
          bool is_eof= false;
          Row_of_fields row(0);
-         system::digest_row_content(response_stream, m_field_count, row, m_storage, is_eof);
+         system::digest_row_content(response_stream,
+            m_field_count, row, m_storage, is_eof, m_capabilities);
          if (is_eof)
            m_current_state= EOF_PACKET;
          else
@@ -90,7 +94,7 @@ void Result_set::digest_row_set()
        default:
          continue;
     }
-  } while (m_current_state != EOF_PACKET);
+  } while (m_current_state != EOF_PACKET && m_current_state != OK_PACKET);
   } catch(boost::system::system_error e)
   {
     // TODO log error
@@ -101,7 +105,8 @@ void Result_set::digest_row_set()
 
 namespace system {
 
-void digest_result_header(std::istream &is, boost::uint64_t &field_count, boost::uint64_t extra)
+void digest_result_header(std::istream &is, boost::uint64_t &field_count, 
+    boost::uint64_t extra, int packet_length, boost::uint32_t capabilities)
 {
   Protocol_chunk<boost::uint64_t> proto_field_count(field_count);
   //Protocol_chunk<boost::uint64_t> proto_extra(extra);
@@ -111,19 +116,25 @@ void digest_result_header(std::istream &is, boost::uint64_t &field_count, boost:
 
   is >> proto_field_count;
      //>> proto_extra;
+
+  if (field_count == 0) {
+    struct st_ok_package ok;
+    prot_parse_ok_message(is, ok, packet_length, capabilities);
+  }
 }
 
 void digest_field_packet(std::istream &is, Field_packet &field_packet)
 {
-  Protocol_chunk_string_len proto_catalog(field_packet.catalog);
-  Protocol_chunk_string_len proto_db(field_packet.db);
-  Protocol_chunk_string_len proto_table(field_packet.table);
-  Protocol_chunk_string_len proto_org_table(field_packet.org_table);
-  Protocol_chunk_string_len proto_name(field_packet.name);
-  Protocol_chunk_string_len proto_org_name(field_packet.org_name);
-  Protocol_chunk<boost::uint8_t>   proto_marker(field_packet.marker);
+  Protocol_chunk_string_encoded proto_catalog(field_packet.catalog);
+  Protocol_chunk_string_encoded proto_db(field_packet.db);
+  Protocol_chunk_string_encoded proto_table(field_packet.table);
+  Protocol_chunk_string_encoded proto_org_table(field_packet.org_table);
+  Protocol_chunk_string_encoded proto_name(field_packet.name);
+  Protocol_chunk_string_encoded proto_org_name(field_packet.org_name);
+  Protocol_chunk<boost::uint64_t>   proto_marker(field_packet.length_fix_fields);
+  proto_marker.set_length_encoded_binary(true);
   Protocol_chunk<boost::uint16_t>  proto_charsetnr(field_packet.charsetnr);
-  Protocol_chunk<boost::uint32_t>  proto_length(field_packet.length);
+  Protocol_chunk<boost::uint32_t>  proto_length(field_packet.column_length);
   Protocol_chunk<boost::uint8_t>   proto_type(field_packet.type);
   Protocol_chunk<boost::uint16_t>  proto_flags(field_packet.flags);
   Protocol_chunk<boost::uint8_t>   proto_decimals(field_packet.decimals);
@@ -145,13 +156,15 @@ void digest_field_packet(std::istream &is, Field_packet &field_packet)
      >> proto_filler;
 }
 
-void digest_marker(std::istream &is)
+void digest_marker(std::istream &is, const boost::uint32_t capabilities)
 {
   struct st_eof_package eof;
-  prot_parse_eof_message(is,eof);
+  prot_parse_eof_message(is, eof, capabilities);
 }
 
-void digest_row_content(std::istream &is, int field_count, Row_of_fields &row, String_storage &storage, bool &is_eof)
+void digest_row_content(std::istream &is, int field_count,
+    Row_of_fields &row, String_storage &storage, bool &is_eof,
+    const boost::uint32_t capabilities)
 {
   boost::uint8_t size;
   Protocol_chunk<boost::uint8_t> proto_size(size);
@@ -161,7 +174,7 @@ void digest_row_content(std::istream &is, int field_count, Row_of_fields &row, S
     /* EOF packet is detected and there are no more rows to be expeced. */
     is_eof= true;
     struct st_eof_package eof;
-    prot_parse_eof_message(is, eof);
+    prot_parse_eof_message(is, eof, capabilities);
     return;
   }
   is.putback((char)size);
@@ -173,6 +186,8 @@ void digest_row_content(std::istream &is, int field_count, Row_of_fields &row, S
     is >> proto_value;
 
     Value value(MYSQL_TYPE_VAR_STRING, storage->length(), storage->c_str());
+    if (proto_value.get_null())
+      value.is_null(true);
     row.push_back(value);
   }
 }

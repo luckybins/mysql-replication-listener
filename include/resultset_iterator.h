@@ -44,9 +44,9 @@ struct Field_packet
     std::string org_table;// Length Coded String
     std::string name;     // Length Coded String
     std::string org_name; // Length Coded String
-    boost::uint8_t marker;       // filler
+    boost::uint64_t length_fix_fields;       // length of fixed-length fields
     boost::uint16_t charsetnr;   // charsetnr
-    boost::uint32_t length;      // length
+    boost::uint32_t column_length;      // column length
     boost::uint8_t type;         // field type
     boost::uint16_t flags;
     boost::uint8_t decimals;
@@ -57,10 +57,14 @@ struct Field_packet
 typedef std::list<std::string > String_storage;
 
 namespace system {
-    void digest_result_header(std::istream &is, boost::uint64_t &field_count, boost::uint64_t extra);
+    //void digest_result_header(std::istream &is, boost::uint64_t &field_count, boost::uint64_t extra);
     void digest_field_packet(std::istream &is, Field_packet &field_packet);
-    void digest_marker(std::istream &is);
-    void digest_row_content(std::istream &is, int field_count, Row_of_fields &row, String_storage &storage, bool &is_eof);
+    void digest_marker(std::istream &is, const boost::uint32_t capabilities);
+    void digest_row_content(std::istream &is, int field_count, Row_of_fields &row,
+        String_storage &storage, bool &is_eof,
+        const boost::uint32_t capabilities);
+    void digest_result_header(std::istream &is, boost::uint64_t &field_count, 
+        boost::uint64_t extra, int packet_length, boost::uint32_t capabilities);
 }
 
 template <class T>
@@ -72,7 +76,8 @@ public:
     typedef Result_set_iterator<Row_of_fields > iterator;
     typedef Result_set_iterator<Row_of_fields const > const_iterator;
 
-    Result_set(tcp::socket *socket) { source(socket); }
+    Result_set(tcp::socket *socket, const boost::uint32_t capabilities) : m_capabilities(capabilities) 
+      { source(socket); }
     void source(tcp::socket *socket) { m_socket= socket; digest_row_set(); }
     iterator begin();
     iterator end();
@@ -93,6 +98,7 @@ private:
                    FIELD_PACKETS,
                    MARKER,
                    ROW_CONTENTS,
+                   OK_PACKET,
                    EOF_PACKET
                  } state_t;
     state_t m_current_state;
@@ -105,6 +111,8 @@ private:
      * Used for SHOW COLUMNS to return the number of rows in the table
      */
     boost::uint64_t m_extra;
+
+    const boost::uint32_t m_capabilities;
 };
 
 template <class Iterator_value_type >

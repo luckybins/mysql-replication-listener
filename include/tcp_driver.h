@@ -34,6 +34,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
      boost::bind(&Binlog_tcp_driver::handle_net_packet_header, this, \
      boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred)) \
 
+#define TYPE_OK_PACKET 0
+#define TYPE_ERR_PACKET 0xff
+#define TYPE_EOF_PACKET 0xfe
 using boost::asio::ip::tcp;
 
 namespace mysql { namespace system {
@@ -119,7 +122,7 @@ private:
      *
      * TODO rename to handle_event_log_packet?
      */
-    void handle_net_packet(const boost::system::error_code& err, std::size_t bytes_transferred);
+    void handle_net_packet(const boost::system::error_code& err, std::size_t bytes_transferred, int length);
 
     /**
      * Called from handle_net_packet(). The function handle a stream of bytes
@@ -233,12 +236,17 @@ private:
  *
  * @return False if the operation succeeded, true if it failed.
  */
-bool fetch_master_status(tcp::socket *socket, std::string *filename, unsigned long *position);
+bool fetch_master_status(tcp::socket *socket, std::string *filename,
+    unsigned long *position, const boost::uint32_t capabilities);
 /**
  * Sends a SHOW BINARY LOGS command to the server and stores the file
  * names and sizes in a map.
  */
-bool fetch_binlogs_name_and_size(tcp::socket *socket, std::map<std::string, unsigned long> &binlog_map);
+bool fetch_binlogs_name_and_size(tcp::socket *socket, std::map<std::string, 
+    unsigned long> &binlog_map, const boost::uint32_t capabilities);
+bool notify_and_check_server_checksum(tcp::socket *socket, 
+    const boost::uint32_t capabilities);
+
 
 int authenticate(tcp::socket *socket, const std::string& user,
                  const std::string& passwd,
@@ -246,7 +254,8 @@ int authenticate(tcp::socket *socket, const std::string& user,
 
 tcp::socket *
 sync_connect_and_authenticate(boost::asio::io_service &io_service, const std::string &user,
-                              const std::string &passwd, const std::string &host, long port);
+                              const std::string &passwd, const std::string &host, long port,
+                              st_handshake_package* p_handshake_package);
 
 
 } }

@@ -54,7 +54,16 @@ const char *get_event_type_str(Log_event_type type)
   case BEGIN_LOAD_QUERY_EVENT: return "Begin_load_query";
   case EXECUTE_LOAD_QUERY_EVENT: return "Execute_load_query";
   case INCIDENT_EVENT: return "Incident";
-  case USER_DEFINED: return "User defined";
+  //case USER_DEFINED: return "User defined";
+  case HEARTBEAT_EVENT: return "HEARTBEAT_EVENT";
+  case IGNORABLE_EVENT: return "IGNORABLE_EVENT";
+  case ROWS_QUERY_EVENT: return "ROWS_QUERY_EVENT";
+  case WRITE_ROWS_EVENTv2: return "WRITE_ROWS_EVENTv2";
+  case UPDATE_ROWS_EVENTv2: return "UPDATE_ROWS_EVENTv2";
+  case DELETE_ROWS_EVENTv2: return "DELETE_ROWS_EVENTv2";
+  case GTID_EVENT: return "GTID_EVENT";
+  case ANONYMOUS_GTID_EVENT: return "ANONYMOUS_GTID_EVENT"; 
+  case PREVIOUS_GTID_EVENT: return "PREVIOUS_GTID_EVENT";  
   default: return "Unknown";
   }
 }

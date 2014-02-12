@@ -81,6 +81,10 @@ protected:
    */
   unsigned long m_binlog_offset;
   std::string m_binlog_file_name;
+  /**
+   * Record format_desc_event
+   */
+  Format_event m_format_desc_event;
 };
 
 } // namespace mysql::system

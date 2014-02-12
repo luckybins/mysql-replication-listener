@@ -33,6 +33,7 @@ namespace mysql
 
   Enumeration type for the different types of log events.
 */
+
 enum Log_event_type
 {
   /*
@@ -84,12 +85,23 @@ enum Log_event_type
   /*
     Something out of the ordinary happened on the master
    */
-  INCIDENT_EVENT= 26,
+  INCIDENT_EVENT= 26, //0x1a
 
           /*
            * A user defined event
            */
-          USER_DEFINED= 27,
+          //USER_DEFINED= 27,
+  HEARTBEAT_EVENT = 0x1b,
+  IGNORABLE_EVENT = 0x1c,
+  ROWS_QUERY_EVENT = 0x1d,
+  WRITE_ROWS_EVENTv2 = 0x1e,
+  UPDATE_ROWS_EVENTv2 = 0x1f,
+  DELETE_ROWS_EVENTv2 = 0x20,
+  GTID_EVENT = 0x21,
+  ANONYMOUS_GTID_EVENT = 0x22,
+  PREVIOUS_GTID_EVENT = 0x23,
+
+  USER_DEFINED = 0x24,
   /*
     Add new events here - right above this comment!
     Existing events (except ENUM_END_EVENT) should never change their numbers
@@ -155,7 +167,11 @@ public:
     /**
      * Return a pointer to the header of the log event
      */
+    
     Log_event_header *header() { return &m_header; }
+    const Log_event_header* header() const {return &m_header;}
+    void set_header(const Log_event_header& header) { m_header = header;}
+
 
 private:
     Log_event_header m_header;
@@ -186,10 +202,26 @@ class Format_event: public Binary_log_event
 {
 public:
     Format_event(Log_event_header *header) : Binary_log_event(header) {}
+    Format_event() {}
     boost::uint16_t binlog_version;
     std::string master_version;
     boost::uint32_t created_ts;
     boost::uint8_t log_header_len;
+    //boost::uint8_t event_type_header_lengths[ENUM_END_EVENT];
+    std::vector<boost::uint8_t> event_type_header_lengths;
+
+    Format_event& operator = (const Format_event& src) {
+      if (this == &src)
+        return *this;
+      const Log_event_header* header = src.header();
+      set_header(*header);
+      binlog_version = src.binlog_version;
+      master_version = src.master_version;
+      created_ts = src.created_ts;
+      log_header_len = src.log_header_len;
+      event_type_header_lengths = src.event_type_header_lengths;
+      return *this;
+    }
 };
 
 class User_var_event: public Binary_log_event
@@ -231,9 +263,12 @@ public:
     Row_event(Log_event_header *header) : Binary_log_event(header) {}
     boost::uint64_t table_id;
     boost::uint16_t flags;
+    boost::uint16_t extra_data_length;
+    std::vector<uint8_t> extra_data;
     boost::uint64_t columns_len;
     boost::uint32_t null_bits_len;
-    std::vector<boost::uint8_t> columns_before_image;
+    //std::vector<boost::uint8_t> columns_before_image;
+    std::vector<boost::uint8_t> columns_after_image;
     std::vector<uint8_t> used_columns;
     std::vector<uint8_t> row;
 };
@@ -262,6 +297,12 @@ public:
     boost::uint64_t xid_id;
 };
 
+class Rows_query_event : public Binary_log_event {
+ public:
+  Rows_query_event(Log_event_header *header) : Binary_log_event(header) {}
+  boost::uint8_t length; // ignore according to mysql doc
+  std::string query_text;
+};
 Binary_log_event *create_incident_event(unsigned int type, const char *message, unsigned long pos= 0);
 
 } // end namespace mysql

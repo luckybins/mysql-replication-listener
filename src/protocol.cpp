@@ -93,7 +93,7 @@ int proto_get_one_package(tcp::socket *socket, boost::asio::streambuf &buff,
 }
 
 void prot_parse_error_message(std::istream &is, struct st_error_package &err,
-                              int packet_length)
+                              const int packet_length, const boost::uint32_t capabilities)
 {
   boost::uint8_t marker;
 
@@ -101,19 +101,24 @@ void prot_parse_error_message(std::istream &is, struct st_error_package &err,
   Protocol_chunk<boost::uint8_t>  prot_marker(marker);
   Protocol_chunk<boost::uint8_t>  prot_sql_state(err.sql_state,5);
 
-  is >> prot_errno
-     >> prot_marker
-     >> prot_sql_state;
+  is >> prot_errno;
+  int message_size = packet_length - 1 - prot_errno.size();
+  if (capabilities & CLIENT_PROTOCOL_41) {
+    is  >> prot_marker
+        >> prot_sql_state;
+    message_size -= prot_marker.size() + prot_sql_state.size();
+  }
 
     // TODO is the number of bytes read = is.tellg() ?
 
-  int message_size= packet_length -2 -1 -5; // the remaining part of the package
+  //int message_size= packet_length -2 -1 -5; // the remaining part of the package
   Protocol_chunk_string prot_message(err.message, message_size);
   is >> prot_message;
   err.message[message_size]= '\0';
 }
 
-void prot_parse_ok_message(std::istream &is, struct st_ok_package &ok, int packet_length)
+void prot_parse_ok_message(std::istream &is, struct st_ok_package &ok,
+    const int packet_length, const boost::uint32_t capabilities)
 {
  // TODO: Assure that zero length messages can be but on the input stream.
 
@@ -124,16 +129,22 @@ void prot_parse_ok_message(std::istream &is, struct st_ok_package &ok, int packe
   Protocol_chunk<boost::uint16_t> prot_warning_count(ok.warning_count);
 
   int message_size= packet_length -2  -prot_affected_rows.size()
-                    -prot_insert_id.size() -prot_server_status.size()
-                    -prot_warning_count.size();
-
+                    -prot_insert_id.size();
+  ok.result_type = 0;
   prot_affected_rows.set_length_encoded_binary(true);
   prot_insert_id.set_length_encoded_binary(true);
 
   is  >> prot_affected_rows
-      >> prot_insert_id
-      >> prot_server_status
-      >> prot_warning_count;
+      >> prot_insert_id;
+
+  if (capabilities & CLIENT_PROTOCOL_41) {
+    is  >> prot_server_status
+        >> prot_warning_count;
+    message_size -= prot_server_status.size() + prot_warning_count.size();
+  } else if (capabilities & CLIENT_TRANSACTIONS) {
+    is  >> prot_server_status;
+    message_size -= prot_server_status.size();
+  }
 
   if (message_size > 0)
   {
@@ -143,53 +154,87 @@ void prot_parse_ok_message(std::istream &is, struct st_ok_package &ok, int packe
   }
 }
 
-void prot_parse_eof_message(std::istream &is, struct st_eof_package &eof)
+void prot_parse_eof_message(std::istream &is, struct st_eof_package &eof, const boost::uint32_t capabilities)
 {
   Protocol_chunk<boost::uint16_t> proto_warning_count(eof.warning_count);
   Protocol_chunk<boost::uint16_t> proto_status_flags(eof.status_flags);
 
-  is >> proto_warning_count
-     >> proto_status_flags;
+  if (capabilities & CLIENT_PROTOCOL_41) {
+    is >> proto_warning_count
+       >> proto_status_flags;
+  }
 }
 
 void proto_get_handshake_package(std::istream &is,
                                  struct st_handshake_package &p,
-                                 int packet_length)
+                                 const int packet_length)
 {
   boost::uint8_t filler;
-  boost::uint8_t filler2[13];
-
+  boost::uint8_t filler2[10];
+  boost::uint16_t capabilities_low, capabilities_high;
+  boost::uint8_t length_auth_plugin_data;
   Protocol_chunk<boost::uint8_t>   proto_protocol_version(p.protocol_version);
   Protocol_chunk<boost::uint32_t>  proto_thread_id(p.thread_id);
   Protocol_chunk<boost::uint8_t>   proto_scramble_buffer(p.scramble_buff, 8);
   Protocol_chunk<boost::uint8_t>   proto_filler(filler);
-  Protocol_chunk<boost::uint16_t>  proto_server_capabilities(p.server_capabilities);
+  Protocol_chunk<boost::uint16_t>  proto_server_capabilities_low(capabilities_low);
   Protocol_chunk<boost::uint8_t>   proto_server_language(p.server_language);
   Protocol_chunk<boost::uint16_t>  proto_server_status(p.server_status);
-  Protocol_chunk<boost::uint8_t>   proto_filler2(filler2,13);
-  Protocol_chunk<boost::uint8_t>   proto_scramble_buffer2(p.scramble_buff2, 13);
+  Protocol_chunk<boost::uint16_t>  proto_server_capabilities_high(capabilities_high);
+  Protocol_chunk<boost::uint8_t>   proto_length_auth_plugin_data(length_auth_plugin_data);
+  Protocol_chunk<boost::uint8_t>   proto_filler2(filler2,10);
+  //Protocol_chunk<boost::uint8_t>   proto_scramble_buffer2(p.scramble_buff2, 13);
 
-  is  >> proto_protocol_version
-      >> p.server_version_str
+  is  >> proto_protocol_version;
+  if (p.protocol_version != 0x0a) {
+    std::cerr << "Unsupported version: " << p.protocol_version << std::endl;
+    exit(-1);
+  }
+  is  >> p.server_version_str
       >> proto_thread_id
       >> proto_scramble_buffer
       >> proto_filler
-      >> proto_server_capabilities
-      >> proto_server_language
-      >> proto_server_status
-      >> proto_filler2
-      >> proto_scramble_buffer2;
+      >> proto_server_capabilities_low;
+  p.server_capabilities = capabilities_low;
 
+  if (packet_length - 1 - 
+      proto_protocol_version.size() - 
+      p.server_version_str.length() - 1 - 
+      proto_thread_id.size() - 
+      proto_scramble_buffer.size() - 
+      proto_filler.size() -
+      proto_server_capabilities_low.size() <= 0)
+    return;
+
+  is  >> proto_server_language
+      >> proto_server_status
+      >> proto_server_capabilities_high
+      >> proto_length_auth_plugin_data // if capabilities & CLIENT_PLUGIN_AUTH else should be 0.
+      >> proto_filler2;
+  p.server_capabilities |= ((boost::uint32_t)capabilities_high) << 16;
+      // >> proto_scramble_buffer2;
+  if (p.server_capabilities & CLIENT_SECURE_CONNECTION) {
+    boost::uint8_t l = length_auth_plugin_data - 8;
+    if (l < 13)
+      l = 13;
+    Protocol_chunk_string proto_scramble_buffer2(p.scramble_buff2, l);
+    is >> proto_scramble_buffer2;
+    p.scramble_buff2[l] = 0;
+  }
+  //scramble_buffer2[l] = 0;
+  if (p.server_capabilities & CLIENT_PLUGIN_AUTH)
+    is >> p.auth_plugin_name;
+  //std::cout << "Auth_plugin_name: " << p.auth_plugin_name << std::endl;
   //assert(filler == 0);
 
-  int remaining_bytes= packet_length - 9+13+13+8;
+/*  int remaining_bytes= packet_length - 9+13+13+8;
   boost::uint8_t extention_buffer[remaining_bytes];
   if (remaining_bytes > 0)
   {
     Protocol_chunk<boost::uint8_t> proto_extension(extention_buffer, remaining_bytes);
     is >> proto_extension;
   }
-
+*/
   //std::copy(&extention_buffer[0],&extention_buffer[remaining_bytes],std::ostream_iterator<char>(std::cout,","));
 }
 
@@ -222,28 +267,30 @@ std::istream &operator>>(std::istream &is, Protocol &chunk)
     int ct= 0;
     is.read((char *)chunk.data(),1);
     unsigned char byte= *(unsigned char *)chunk.data();
-    if (byte < 250)
+    //if (byte < 250)
+    if (byte < 0xfb)
     {
       chunk.collapse_size(1);
       return is;
     }
-    else if (byte == 251)
+    else if (byte == 251) //0xfb
     {
       // is this a row data packet? if so, then this column value is NULL
       chunk.collapse_size(1);
       ct= 1;
     }
-    else if (byte == 252)
+    else if (byte == 252) // 0xfc
     {
       chunk.collapse_size(2);
-      ct= 1;
+      //ct= 1;
     }
-    else if(byte == 253)
+    else if(byte == 253) // 0xfd
     {
       chunk.collapse_size(3);
-      ct= 1;
+      //ct= 1;
     }
 
+    // TODO byte == 0xfe need to check th length of the packet to verify that t has enough space for a 8-byte integer
     /* Read remaining bytes */
     //is.read((char *)chunk.data(), chunk.size()-1);
     char ch;
@@ -307,6 +354,23 @@ std::istream &operator>>(std::istream &is, Protocol_chunk_string_len &lenstr)
   std::string *str= lenstr.m_storage;
   Protocol_chunk<boost::uint8_t> proto_str_len(len);
   is >> proto_str_len;
+
+  Protocol_chunk_string   proto_str(*str, len);
+  is >> proto_str;
+  return is;
+}
+
+std::istream &operator >> (std::istream &is, Protocol_chunk_string_encoded& encstr) {
+  boost::uint64_t len;
+  std::string *str= encstr.m_storage;
+  Protocol_chunk<boost::uint64_t> proto_str_len(len);
+  proto_str_len.set_length_encoded_binary(true);
+  is >> proto_str_len;
+
+  if (len == 0xfb && proto_str_len.size() == 1) {
+    encstr.set_null(true);
+    return is;
+  }
   Protocol_chunk_string   proto_str(*str, len);
   is >> proto_str;
   return is;
@@ -408,46 +472,68 @@ Incident_event *proto_incident_event(std::istream &is, Log_event_header *header)
   return incident;
 }
 
-Row_event *proto_rows_event(std::istream &is, Log_event_header *header)
+Row_event *proto_rows_event(std::istream &is, Log_event_header *header, Format_event& format_desc_event)
 {
   Row_event *rev=new Row_event(header);
+  int bytes_left = header->event_length - LOG_EVENT_HEADER_SIZE + 1;
 
+  // header:
   union
   {
     boost::uint64_t integer;
     boost::uint8_t bytes[6];
-  } table_id;
+  } table_id; // Little endian?
 
   table_id.integer=0L;
   Protocol_chunk<boost::uint8_t>  proto_table_id(&table_id.bytes[0], 6);
+  if (format_desc_event.event_type_header_lengths[header->type_code] == 6)
+    proto_table_id.collapse_size(4);
   Protocol_chunk<boost::uint16_t> proto_flags(rev->flags);
+  is >> proto_table_id
+     >> proto_flags;
+  rev->table_id=table_id.integer;
+  bytes_left -= proto_table_id.size() + proto_flags.size();
+
+  if (header->type_code == WRITE_ROWS_EVENTv2 ||
+      header->type_code == UPDATE_ROWS_EVENTv2 ||
+      header->type_code == DELETE_ROWS_EVENTv2) {
+    Protocol_chunk<boost::uint16_t> proto_extra_data_length(rev->extra_data_length);
+    is >> proto_extra_data_length;
+    bytes_left -= proto_extra_data_length.size();
+    Protocol_chunk_vector proto_extra_data(rev->extra_data, rev->extra_data_length - 2);
+    is >> proto_extra_data;
+    bytes_left -= proto_extra_data.size();
+  }
+
+  // body:
   Protocol_chunk<boost::uint64_t> proto_column_len(rev->columns_len);
   proto_column_len.set_length_encoded_binary(true);
 
-  is >> proto_table_id
-     >> proto_flags
-     >> proto_column_len;
+  is >> proto_column_len;
+  bytes_left -= proto_column_len.size();
 
-  rev->table_id=table_id.integer;
   int used_column_len=(int) ((rev->columns_len + 7) / 8);
   Protocol_chunk_vector proto_used_columns(rev->used_columns, used_column_len);
   rev->null_bits_len= used_column_len;
-
   is >> proto_used_columns;
+  bytes_left -= proto_used_columns.size();
 
-  if (header->type_code == UPDATE_ROWS_EVENT)
+  if (header->type_code == UPDATE_ROWS_EVENT ||
+      header->type_code == UPDATE_ROWS_EVENTv2)
   {
-    Protocol_chunk_vector proto_columns_before_image(rev->columns_before_image, used_column_len);
-    is >> proto_columns_before_image;
+    Protocol_chunk_vector proto_columns_after_image(rev->columns_after_image, used_column_len);
+    is >> proto_columns_after_image;
+    bytes_left -= proto_columns_after_image.size();
   }
 
-  int bytes_read=proto_table_id.size() + proto_flags.size() + proto_column_len.size() + used_column_len;
-  if (header->type_code == UPDATE_ROWS_EVENT)
-    bytes_read+=used_column_len;
+  //int bytes_read=proto_table_id.size() + proto_flags.size() + proto_column_len.size() + used_column_len;
+  //if (header->type_code == UPDATE_ROWS_EVENT ||
+  //    header->type_code == UPDATE_ROWS_EVENTv2)
+  //  bytes_read+=used_column_len;
 
-  unsigned long row_len= header->event_length - bytes_read - LOG_EVENT_HEADER_SIZE + 1;
+  //unsigned long row_len= header->event_length - bytes_read - LOG_EVENT_HEADER_SIZE + 1;
   //std::cout << "Bytes read: " << bytes_read << " Bytes expected: " << rev->row_len << std::endl;
-  Protocol_chunk_vector proto_row(rev->row, row_len);
+  Protocol_chunk_vector proto_row(rev->row, bytes_left);
   is >> proto_row;
 
   return rev;
@@ -541,7 +627,26 @@ Table_map_event *proto_table_map_event(std::istream &is, Log_event_header *heade
   is >> proto_null_bits;
   return tmev;
 }
+Format_event* proto_desc_event(std::istream& is, Log_event_header* header) {
+  Format_event *event = new Format_event(header);
+  Protocol_chunk<boost::uint16_t> proto_binlog_version(event->binlog_version);
+  Protocol_chunk_string           proto_mysql_server_version(event->master_version, 50);
+  Protocol_chunk<boost::uint32_t> proto_create_timestamp(event->created_ts);
+  Protocol_chunk<boost::uint8_t>  proto_event_header_length(event->log_header_len);
 
+  is >> proto_binlog_version
+     >> proto_mysql_server_version
+     >> proto_create_timestamp
+     >> proto_event_header_length;
+  if (event->log_header_len != 19)
+    std::cerr << "Warning: Unexpected header_len = " << event->log_header_len << " which should be 19" << std::endl;
+  int types = header->event_length - event->log_header_len - 2 - 50 - 4 - 1;
+  Protocol_chunk_vector           proto_event_type_header_lengths(event->event_type_header_lengths, types);
+  is >> proto_event_type_header_lengths;
+
+  event->event_type_header_lengths.insert(event->event_type_header_lengths.begin(), 0xff);
+  return event;
+}
 std::istream &operator>>(std::istream &is, Protocol_chunk_vector &chunk)
 {
   unsigned long size= chunk.m_size;
