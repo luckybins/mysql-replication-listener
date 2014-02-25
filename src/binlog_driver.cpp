@@ -67,6 +67,9 @@ Binary_log_event* Binary_log_driver::parse_event(std::istream &is,
     case FORMAT_DESCRIPTION_EVENT:
       parsed_event = proto_desc_event(is, header);
       break;
+    case ROWS_QUERY_EVENT:
+      parsed_event = proto_rows_query_event(is, header);
+      break;
     default:
       {
         // Create a dummy driver.

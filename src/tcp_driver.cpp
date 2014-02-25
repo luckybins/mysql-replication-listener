@@ -66,7 +66,7 @@ static void store_handshake_package(st_handshake_package* dest, const st_handsha
 
   if (!m_socket)
   {
-    if ((m_socket=sync_connect_and_authenticate(m_io_service, user, passwd, host, port, &m_handshake_package)) == 0)
+    if ((m_socket=sync_connect_and_authenticate(m_io_service, user, passwd, host, port, &m_capability_flags, m_master_id, m_slave_id)) == 0)
       return 1;
   }
 
@@ -75,7 +75,7 @@ static void store_handshake_package(st_handshake_package* dest, const st_handsha
    */
   if (binlog_filename == "")
   {
-    if (fetch_master_status(m_socket, &m_binlog_file_name, &m_binlog_offset, m_handshake_package.server_capabilities))
+    if (fetch_master_status(m_socket, &m_binlog_file_name, &m_binlog_offset, m_capability_flags))
       return 1;
   } else
   {
@@ -83,7 +83,7 @@ static void store_handshake_package(st_handshake_package* dest, const st_handsha
     m_binlog_offset=offset;
   }
 
-  if (notify_and_check_server_checksum(m_socket, m_handshake_package.server_capabilities)) {
+  if (notify_and_check_server_checksum(m_socket, m_capability_flags)) {
     return 2;
   }
 
@@ -95,7 +95,8 @@ static void store_handshake_package(st_handshake_package* dest, const st_handsha
 
 tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service,
     const std::string &user, const std::string &passwd,
-    const std::string &host, long port, st_handshake_package* p_handshake_package)
+    const std::string &host, long port, boost::uint32_t* capablity_flags,
+    const boost::uint32_t master_id, const boost::uint32_t slave_id)
 {
 
   tcp::resolver resolver(io_service);
@@ -170,11 +171,13 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service,
   struct st_handshake_package handshake_package;
 
   proto_get_handshake_package(server_stream, handshake_package, packet_length);
-  store_handshake_package(p_handshake_package, handshake_package);
-  const boost::uint32_t capabilities = handshake_package.server_capabilities;
+  //store_handshake_package(p_handshake_package, handshake_package);
+  
   if (authenticate(socket, user, passwd, handshake_package))
     return 0;
 
+  *capablity_flags = handshake_package.server_capabilities & CLIENT_BASIC_FLAGS;
+  const boost::uint32_t capabilities = *capablity_flags;
   /*
    * Register slave to master
    */
@@ -183,26 +186,14 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service,
 
   
   static boost::uint8_t com_register_slave = COM_REGISTER_SLAVE;
-  boost::uint32_t server_id = 1;
   boost::uint32_t rpl_recovery_rank = 0;
   
   Protocol_chunk<boost::uint8_t> prot_command(com_register_slave);
   Protocol_chunk<boost::uint16_t> prot_connection_port(port);
   Protocol_chunk<boost::uint32_t> prot_rpl_recovery_rank(rpl_recovery_rank);
-  Protocol_chunk<boost::uint32_t> prot_server_id(server_id);
+  Protocol_chunk<boost::uint32_t> prot_slave_id(slave_id);
 
-  const char* env_libreplication_server_id = std::getenv("LIBREPLICATION_SERVER_ID");
-
-  if (env_libreplication_server_id != 0) {
-    try {
-      boost::uint32_t libreplication_server_id = boost::lexical_cast<boost::uint32_t>(env_libreplication_server_id);
-      prot_server_id = libreplication_server_id;
-    } catch (boost::bad_lexical_cast e) {
-      // XXX: nothing to do
-    }
-  }
-
-  boost::uint32_t master_server_id = 123; // Should be args to get.
+  boost::uint32_t master_server_id = master_id; // Should be args to get.
   boost::uint8_t host_size = host.size();
   boost::uint8_t user_size = user.size();
   boost::uint8_t passwd_size = passwd.size();
@@ -213,7 +204,7 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service,
   Protocol_chunk<boost::uint8_t> prot_passwd_strlen(passwd_size);
 
   command_request_stream << prot_command
-          << prot_server_id
+          << prot_slave_id
           << prot_report_host_strlen
           << host
           << prot_user_strlen
@@ -262,6 +253,7 @@ tcp::socket *sync_connect_and_authenticate(boost::asio::io_service &io_service,
   } else if (result_type == TYPE_EOF_PACKET) {
     struct st_eof_package eof_package;
     prot_parse_eof_message(cmd_response_stream, eof_package, capabilities);
+    return 0;
   }
 
   return socket;
@@ -384,7 +376,7 @@ void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, 
       dynamic payload.
      */
     //std::cerr << "Consuming event stream for header. Size before: " << m_event_stream_buffer.size() << std::endl;
-    if (!proto_event_packet_header(m_event_stream_buffer, m_waiting_event, packet_length, m_handshake_package.server_capabilities)) {
+    if (!proto_event_packet_header(m_event_stream_buffer, m_waiting_event, packet_length, m_capability_flags)) {
       m_shutdown = true;
     }
     //std::cerr << " Size after: " << m_event_stream_buffer.size() << std::endl;
@@ -398,7 +390,8 @@ void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, 
      size of the header, the event object is complete.
      Next we need to parse the payload buffer
      */
-    m_waiting_event->event_length -= 4; /// ignore checksum
+    if (m_event_has_checksum)
+      m_waiting_event->event_length -= 4; /// ignore checksum
     std::istream is(&m_event_stream_buffer);
     Binary_log_event * event= parse_event(is, m_waiting_event);
     if (m_waiting_event->type_code == FORMAT_DESCRIPTION_EVENT) {
@@ -407,27 +400,6 @@ void Binlog_tcp_driver::handle_net_packet(const boost::system::error_code& err, 
     m_event_stream_buffer.consume(m_event_stream_buffer.size());
     m_event_queue->push_front(event);
 
-    //////////////////////////
-    /*{
-      boost::uint8_t pack = 0;
-      boost::asio::streambuf resp;
-      int length = proto_get_one_package(m_socket, resp, &pack);
-      std::istream response_stream(&resp);
-
-      boost::uint8_t result_type;
-      Protocol_chunk<boost::uint8_t> prot_result_type(result_type);
-
-
-      response_stream >> prot_result_type;
-      if (result_type == TYPE_ERR_PACKET)
-      {
-        struct st_error_package error_package;
-        prot_parse_error_message(response_stream, error_package, length, m_handshake_package.server_capabilities);
-        std::cout << error_package.message << std::endl;
-        return;
-      }
-    }*/
-    ///////////////////////
     /*
       Note on memory management: The pushed Binary_log_event will be
       deleted in user land.
@@ -499,7 +471,7 @@ void Binlog_tcp_driver::handle_net_packet_header(
     /*
      * Send authentication package
      */
-    const boost::uint32_t capabilities = handshake_package.server_capabilities;
+    const boost::uint32_t capabilities = handshake_package.server_capabilities & CLIENT_BASIC_FLAGS;
     boost::asio::streambuf auth_request_header;
     boost::asio::streambuf auth_request;
     std::string database("mysql"); // 0 terminated
@@ -522,10 +494,9 @@ void Binlog_tcp_driver::handle_net_packet_header(
       passwd_length= encrypt_password(reply, scramble_buff, passwd.c_str());
     delete scramble_buff;
 
-    static boost::uint32_t client_basic_flags = CLIENT_BASIC_FLAGS;
     static boost::uint32_t max_packet_size = MAX_PACKAGE_SIZE;
     
-    Protocol_chunk<boost::uint32_t> prot_client_flags(client_basic_flags);
+    Protocol_chunk<boost::uint32_t> prot_client_flags(capabilities);
     Protocol_chunk<boost::uint32_t> prot_max_packet_size(max_packet_size);
     Protocol_chunk<boost::uint8_t>  prot_charset_number(handshake_package.server_language);
     Protocol_chunk<boost::uint8_t>  prot_filler_buffer(filler_buffer, 23);
@@ -685,11 +656,11 @@ int Binlog_tcp_driver::set_position(const std::string &str, unsigned long positi
   tcp::socket *socket;
 
   if ((socket= sync_connect_and_authenticate(
-      io_service, m_user, m_passwd, m_host, m_port, &m_handshake_package)) == 0)
+      io_service, m_user, m_passwd, m_host, m_port, &m_capability_flags, m_master_id, m_slave_id)) == 0)
     return ERR_FAIL;
 
   std::map<std::string, unsigned long > binlog_map;
-  fetch_binlogs_name_and_size(socket, binlog_map, m_handshake_package.server_capabilities);
+  fetch_binlogs_name_and_size(socket, binlog_map, m_capability_flags);
   socket->close();
   delete socket;
 
@@ -739,10 +710,10 @@ int Binlog_tcp_driver::get_position(std::string *filename_ptr, unsigned long *po
   tcp::socket *socket;
 
   if ((socket=sync_connect_and_authenticate(
-      io_service, m_user, m_passwd, m_host, m_port, &m_handshake_package)) == 0)
+      io_service, m_user, m_passwd, m_host, m_port, &m_capability_flags, m_master_id, m_slave_id)) == 0)
     return ERR_FAIL;
 
-  if (fetch_master_status(socket, &m_binlog_file_name, &m_binlog_offset, m_handshake_package.server_capabilities))
+  if (fetch_master_status(socket, &m_binlog_file_name, &m_binlog_offset, m_capability_flags))
     return ERR_FAIL;
 
   socket->close();

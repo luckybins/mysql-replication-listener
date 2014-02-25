@@ -647,6 +647,17 @@ Format_event* proto_desc_event(std::istream& is, Log_event_header* header) {
   event->event_type_header_lengths.insert(event->event_type_header_lengths.begin(), 0xff);
   return event;
 }
+Rows_query_event* proto_rows_query_event(std::istream& is, Log_event_header* header) {
+  Rows_query_event *event = new Rows_query_event(header);
+  Protocol_chunk<boost::uint8_t> proto_length(event->length);
+  Protocol_chunk_string          proto_query_text(event->query_text, header->event_length - proto_query_text.size());
+
+  is >> proto_length
+     >> proto_query_text;
+
+  return event;
+}
+
 std::istream &operator>>(std::istream &is, Protocol_chunk_vector &chunk)
 {
   unsigned long size= chunk.m_size;

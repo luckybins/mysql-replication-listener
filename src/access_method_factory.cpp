@@ -20,6 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
 #include "access_method_factory.h"
 #include "tcp_driver.h"
 #include "file_driver.h"
+#include <boost/lexical_cast.hpp>
 
 using mysql::system::Binary_log_driver;
 using mysql::system::Binlog_tcp_driver;
@@ -74,10 +75,27 @@ static Binary_log_driver *parse_mysql_url(const char *body, size_t len)
 
   /* Host name is now the string [host, port-1) if port != NULL and [host, EOS) otherwise. */
   /* Port number is stored in portno, either the default, or a parsed one */
+  uint32_t master_id = 0, slave_id = 1;
+  bool checksum = false;
+  const char* env_libreplication_server_id = std::getenv("LIBREPLICATION_SERVER_ID");
+  const char* env_libreplication_slave_id = std::getenv("LIBREPLICATION_SLAVE_ID");
+  const char* env_libreplication_checksum = std::getenv("LIBREPLICATION_CHECKSUM");
+  try {
+    if (env_libreplication_server_id)
+      master_id = boost::lexical_cast<boost::uint32_t>(env_libreplication_server_id);
+    if (env_libreplication_slave_id)
+      slave_id = boost::lexical_cast<boost::uint32_t>(env_libreplication_slave_id);
+    if (env_libreplication_checksum)
+      checksum = boost::lexical_cast<bool>(env_libreplication_checksum);
+    
+  } catch (boost::bad_lexical_cast e) {
+      // XXX: nothing to do
+  }
+
   return new Binlog_tcp_driver(std::string(user, user_end - user),
                                std::string(pass, pass_end - pass),
                                std::string(host, host_end - host),
-                               portno);
+                               portno, master_id, slave_id, checksum);
 }
 
 

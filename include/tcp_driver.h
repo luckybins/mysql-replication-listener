@@ -45,12 +45,15 @@ class Binlog_tcp_driver : public Binary_log_driver
 {
 public:
 
-    Binlog_tcp_driver(const std::string& user, const std::string& passwd,
-                      const std::string& host, unsigned long port)
+    Binlog_tcp_driver(const std::string user, const std::string passwd,
+                      const std::string host, unsigned long port,
+                      const boost::uint32_t master_id, const boost::uint32_t slave_id,
+                      bool event_checksum)
       : Binary_log_driver("", 4), m_host(host), m_user(user), m_passwd(passwd),
         m_port(port), m_socket(NULL), m_waiting_event(0), m_event_loop(0),
         m_total_bytes_transferred(0), m_shutdown(false),
-        m_event_queue(new bounded_buffer<Binary_log_event*>(50))
+        m_event_queue(new bounded_buffer<Binary_log_event*>(50)),
+        m_master_id(master_id), m_slave_id(slave_id), m_event_has_checksum(event_checksum)
     {
     }
 
@@ -172,11 +175,14 @@ private:
     boost::asio::io_service m_io_service;
     tcp::socket *m_socket;
     bool m_shutdown;
+    bool m_event_has_checksum;
+    boost::uint32_t m_master_id, m_slave_id;
 
     /**
      * Temporary storage for a handshake package
      */
-    st_handshake_package m_handshake_package;
+    //st_handshake_package m_handshake_package;
+    boost::uint32_t m_capability_flags;
 
     /**
      * Temporary storage for an OK package
@@ -250,12 +256,13 @@ bool notify_and_check_server_checksum(tcp::socket *socket,
 
 int authenticate(tcp::socket *socket, const std::string& user,
                  const std::string& passwd,
-                 const st_handshake_package &handshake_package);
+                 const st_handshake_package &m_capability_flags);
 
 tcp::socket *
 sync_connect_and_authenticate(boost::asio::io_service &io_service, const std::string &user,
                               const std::string &passwd, const std::string &host, long port,
-                              st_handshake_package* p_handshake_package);
+                              boost::uint32_t* capablity_flags,
+                              boost::uint32_t master_id, boost::uint32_t slave_id);
 
 
 } }
